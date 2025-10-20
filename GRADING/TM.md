@@ -1,15 +1,20 @@
----
-Изменено:
-  - 20-10-2025, 21:12
-Дата создания: 20-10-2025, 21:12
----
-# TM — Модель угроз (Consolidated, RU)
-Версия: 1.1 • Дата: 2025-10-20 • Владелец: Security/Architecture
+# TM - Требования безопасности + Модель угроз + ADR
 
-## 1) Область и обзор системы
-Цель: сервисы **Аутентификации/Сброса пароля (S1)**, **Импорта CSV (S2)** и **Экспорта CSV/JSON (S3)** за API‑шлюзом (**A**), с хранилищем (**D: PostgreSQL/объектное**), интеграциями SMTP (**X**) и внешним Analytics API (**Y**). Разделены границы доверия: Интернет ↔ Сервис, Сервис ↔ Внешние провайдеры, Сервис ↔ Хранилища.
+---
 
-### 1.1 DFD (Mermaid)
+## 0) Мета
+
+- **Версия (commit/date):** 1 / 2025-10-12
+- **Кратко (1-2 предложения):** Система с импортом/экспортом .csv файлов, и фунционалом разлогина
+
+---
+
+## 1) Архитектура и границы доверия (TM1, S04)
+
+- **Роли/активы:** пользователь; ПДн/токены/данные в формате .csv
+- **Зоны доверия:** Internet / DMZ / Internal 
+- **Context/DFD:**
+
 ```mermaid
 flowchart LR
   %% --- Trust boundaries ---
@@ -53,154 +58,103 @@ flowchart LR
   %% --- Границы доверия ---
   classDef boundary fill:#f6f6f6,stroke:#999,stroke-width:1px;
   class Internet,Service,External boundary;
-
-### 1.2 Диаграмма контекста (Mermaid)
-```mermaid
-graph TD
-  U[Users/Admins] -->|HTTPS| A[API Gateway]
-  A -->|RBAC| S3[Export Service]
-  A -->|Validation| S2[Import Service]
-  A -->|Reset Flow| S1[Auth/Reset Service]
-  S1 -->|Hash(token), Audit| D[(DB/Storage)]
-  S2 -->|Validated rows| D
-  S3 -->|Read/Mask| D
-  S1 -->|Email reset| X[SMTP]
-  S3 -->|Optional calls| Y[Analytics API]
 ```
 
-## 2) Активы и цели безопасности
-- **Учётные данные и токены сброса** — конфиденциальность, целостность, одноразовость.
-- **Наборы клиентских данных/PII** — конфиденциальность, минимизация, законность обработки (GDPR/152‑ФЗ).
-- **Доступность сервисов импорта/экспорта** — соблюдение SLO.
-- **Операционные логи/аудит** — структурированные, без секретов/PII, трассировка по `correlation_id`.
+## 2) Реестр угроз STRIDE (TM2, TM3, S04)
 
-## 3) Зоны доверия
-1) Интернет ↔ Сервис (U↔A) — публичные API, загрузка/выгрузка файлов.  
-2) Сервис ↔ Внешние (A↔X/Y) — почта/3rd‑party API.  
-3) Сервис ↔ Хранилища (S*↔D) — БД/объектное, политики жизненного цикла.
+| Element | Data/Boundary | Threat | Description | NFR link (ID) | Mitigation idea (ADR later) |
+|----------|---------------|---------|-------------|---------------|------------------------------|
+| Edge: U→A | Public API | S | Подмена токена авторизации при импорте/экспорте | NFR-013-7, NFR-014-5 | JWT TTL + подпись |
+| Edge: U→A | File upload | T | Изменение CSV перед валидацией (инъекция формул) | NFR-013-1 | InputValidation + sanitize |
+| Edge: U→A | Auth forms | S | Подмена email при запросе сброса пароля | NFR-003-6 | CAPTCHA + rate limit |
+| Node: S1 Auth | Token | I | Утечка токена сброса в логах | NFR-003-4 | Маскирование токенов |
+| Node: S2 Import | CSV file | I | Утечка PII в CSV при ошибке схемы | NFR-013-8 | PII check + reject |
+| Node: S3 Export | Query result | I | Экспорт с PII без прав | NFR-014-1 | Role check + include_pii=false |
+| Node: A | Controller | D | Массовые запросы (DoS) на импорт/экспорт | NFR-013-5, NFR-014-2 | RateLimit middleware |
+| Edge: S2→D | SQL insert | T | Изменение записей при импорте | NFR-013-2 | Parameterized queries |
+| Edge: S3→D | SQL select | I | Утечка tenant data | NFR-014-10 | Tenant isolation |
+| Node: D | Database | R | Нет аудита операций импорта/экспорта | NFR-013-10, NFR-014-7 | Audit log on commit |
+| Node: S3 | Business logic | E | Обход RBAC при экспорте | NFR-014-5 | Role check in query |
+| Edge: S1→X | SMTP | D | Повторные письма при сбое | need NFR | Retry + CircuitBreaker |
+| Edge: S3→Y | External API | D | Нет таймаутов, зависание | need NFR | Timeout ≤2s, retry ≤3 |
+| Node: S2 | Job Worker | R | Нет логов фоновых задач импорта | NFR-013-3 | Correlation ID + jobId |
+| Node: S1 | Audit | R | Нет записи о смене пароля | NFR-003-4 | Audit event |
+| Node: A | Public API | I | Ошибки API раскрывают внутренние поля | NFR-013-6, NFR-014-4 | RFC7807 errors |
+| Node: D | Storage | I | Хранение CSV без шифрования | need NFR | AES-256 at rest |
+| Node: D | Storage | D | Переполнение хранилища большими CSV | NFR-013-1 | File size ≤10 MiB |
+| Node: S3 | Performance | D | Долгие выгрузки блокируют сервер | NFR-014-3 | Async export job |
+| Node: U | Client | S | Фишинговые ссылки сброса | NFR-003-2 | Signed HTTPS link |
 
-## 4) STRIDE 
+---
 
-| Категория | Пример в контексте | Основная защита |
-|---|---|---|
-| S (Spoofing) | Подделка запросов, фишинговые ссылки сброса | Подписанные ссылки, единый ответ на неизвестный email, rate‑limit |
-| T (Tampering) | Вредоносный CSV (формульная инъекция, схема) | MIME/размер, белый список схемы, нормализация, защита формул |
-| R (Repudiation) | Отказ от факта импорта/экспорта/сброса | Аудит, неизменяемые логи, `correlation_id` |
-| I (Information Disclosure) | Утечка PII при экспорте/в логах | RBAC `include_pii`, маскирование, запрет секретов в логах |
-| D (Denial of Service) | Массовые импорты/экспорты, тяжелые запросы | Rate‑limit, очереди/воркеры, таймауты |
-| E (Elevation of Privilege) | Обход ролей при экспорте | Централизованный RBAC, проверка на шлюзе и в сервисе |
+## 3) Приоритизация и Top-5 _(TM3, S04)_
 
-## 5) Реестр рисков (топ)
-| ID       | Риск                                       | L (вер.) | I (влияние) | E (экспозиция) | S (чувств.) | F/O (частота / обнаруж.) | Обоснование                                                                                                                                                                                                                   |
-| -------- | ------------------------------------------ | :------: | :---------: | :------------: | :---------: | :----------------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **R-04** | **Tampering при импорте CSV**              |    H     |      H      |       H        |      M      |          H / L           | Импорт — массовая операция, CSV-файлы часто из внешних источников. Возможна подмена данных, формульные инъекции в Excel, XSS при просмотре. Обнаружение сложно до этапа обработки. Требуется строгая валидация, MIME и схема. |
-| **R-03** | **Утечка PII при экспорте**                |    M     |      C      |       M        |      H      |          M / M           | Экспорт содержит потенциально конфиденциальные поля (ФИО, email, телефон, ИНН). Ошибки ролей (`include_pii`) или дефолтных параметров приводят к массовой утечке. Обнаружить утечку можно только ретроспективно по SIEM.      |
-| **R-05** | **Фишинг/злоупотребление письмами сброса** |    M     |      H      |       H        |      H      |          H / M           | Письма сброса рассылаются во внешнюю среду, возможна подмена URL/доменов. Пользователи уязвимы к фишингу. Часто, но относительно легко отслеживается по аномалиям в логах.                                                    |
-| **R-01** | **Утечка токенов в логах**                 |    L     |      H      |       M        |      H      |          L / H           | Токен — высокочувствительный артефакт (доступ к аккаунту). Ошибки форматирования логов или verbose-режим в debug могут случайно вывести токен. Легко предотвратить, но сложно отследить задним числом.                        |
-| **R-02** | **DoS массовыми импортами/экспортами**     |    M     |      M      |       H        |      L      |          H / M           | Большой объём данных или частые запросы могут исчерпать ресурсы (I/O, CPU). Возможен намеренный DoS. Обнаруживается метриками, но требует лимитов и очередей.                                                                 |
+| Rank | Risk | Причина высокой оценки | ADR candidate |
+|------|------|------------------------|---------------|
+| 1 | R-04 | Вредоносный CSV (Tampering) — высокая вероятность и серьёзный ущерб | Schema + sanitize CSV |
+| 2 | R-03 | Утечка персональных данных при экспорте — критичный ущерб приватности | Role-based filter PII |
+| 3 | R-05 | Фишинговые письма сброса пароля — высокая частота и тяжёлые последствия | Signed HTTPS reset link |
+| 4 | R-01 | Утечка токенов сброса в логах — прямая компрометация аккаунтов | Mask tokens in logs |
+| 5 | R-02 | Массовые DoS-запросы — угроза доступности сервиса | Global RateLimit + Queue |
 
-[## 6) Контроли (NFR, выдержки)
-**US‑003 Сброс пароля**: энтропия ≥ 128 бит, TTL ≤ 15 мин, одноразово; хранить SHA‑256 хэш; унифицированный ответ; ошибки RFC7807; аудит (время/ip/user_id/correlation_id); лимит ≤5/час на IP/email; почтовые политики SPF/DKIM/DMARC; HSTS.  
-**US‑013 Импорт CSV**: ≤10 MiB; MIME allowlist; жёсткая схема (лишние колонки — reject); нормализация (UTC ISO‑8601, NFC, E.164); защита формул; журнал jobId; RFC7807; RBAC (manager/admin).  
-**US‑014 Экспорт CSV/JSON**: по умолчанию **без PII**; `include_pii=true` только `admin|dpo`; маскирование; retention 7–30 дней; лимиты/таймауты; RFC7807; owner‑only; аудит/метрики.
+---
 
-## 7) Принятые решения (ADR)
+## 4) Требования (S03) и ADR-решения (S05) под Top-5 (TM4)
+
+## US-003 — Password Reset
+
+| ID | User Story / Feature | Category | Requirement (NFR) | Rationale / Risk | Acceptance (G-W-T) | Evidence (test/log/scan/policy) | Trace (issue/link) | Owner | Status | Priority | Severity | Tags |
+| -- | -------------------- | -------- | ----------------- | ---------------- | ------------------ | ------------------------------- | ------------------ | ----- | ------ | ----------- | ---------- | ---- |
+| NFR-003-1 | US-003 Password Reset | Security-Secrets | Токен сброса — ≥128 бит, TTL ≤15 мин, одноразовый, хранится в виде SHA-256 хэша | Предотвращение компрометации и повторного использования токена | **Given** пользователь запрашивает сброс <br>**When** создаётся токен <br>**Then** токен имеет ≥128-битную энтропию, действует ≤15 мин, одноразовый | unit: `token-entropy`; scan: secrets-storage | #US-003 | backend | Draft | P1 - High | S1 - Critical | security,secrets |
+| NFR-003-2 | US-003 Password Reset | Privacy/PII | В письме отсутствуют персональные данные, только ссылка; email подтверждён | Минимизация утечки PII через почту | **Given** запрос на сброс <br>**When** письмо отправлено <br>**Then** нет логина, телефона, имени; только ссылка с токеном | e2e: `email-template-check` | #US-003 | backend | Draft | P2 - Medium | S2 - Major | privacy,pii |
+| NFR-003-3 | US-003 Password Reset | API-Contract/Errors | `/api/auth/forgot` и `/api/auth/reset` возвращают ошибки в RFC7807; одинаковый ответ при неверном email | Исключение утечек о наличии пользователя | **Given** неверный email <br>**When** POST `/api/auth/forgot` <br>**Then** 200 с сообщением “If account exists…” | contract test; API schema | #US-003 | backend | Draft | P1 - High | S2 - Major | api,errors |
+| NFR-003-4 | US-003 Password Reset | Auditability | Все попытки сброса логируются с `timestamp`, `ip`, `user_id/null`, `correlation_id` | Трассировка инцидентов безопасности | **Given** запрос на сброс <br>**When** операция завершается <br>**Then** в audit-логах запись с user_id/ip/time | SIEM rule; log sample | #US-003 | devops | Proposed | P2 - Medium | S3 - Minor | audit,logging |
+| NFR-003-5 | US-003 Password Reset | Security-PasswordPolicy | Новый пароль ≥12 символов, ≥1 заглавная, ≥1 цифра, ≥1 спецсимвол; не совпадает с последними 3 | Повышение стойкости и предотвращение reuse | **Given** слабый пароль <br>**When** POST `/api/auth/reset` <br>**Then** 400 и описание нарушенной политики | e2e: `password-policy`; unit validator | #US-003 | backend | Draft | P1 - High | S2 - Major | password,security |
+| NFR-003-6 | US-003 Password Reset | Security-RateLimiting | Не более 5 запросов на сброс/час с одного IP или email | Защита от перебора email и DoS | **Given** 6-й запрос за час <br>**When** POST `/api/auth/forgot` <br>**Then** 429 с Retry-After | e2e: `reset-limit-test`; logs | #US-003 | backend | Proposed | P2 - Medium | S2 - Major | ratelimit,security |
+| NFR-003-7 | US-003 Password Reset | Observability/Logging | Все события сброса помечаются `correlation_id`, формат логов JSON | Обеспечение трассировки по запросу | **Given** X-Correlation-ID <br>**When** сброс выполняется <br>**Then** correlation_id сохраняется во всех логах | log grep по id | #US-003 | devops | Proposed | P3 - Low | S3 - Minor | observability |
+| NFR-003-8 | US-003 Password Reset | Availability | `/api/auth/forgot` и `/api/auth/reset` доступны ≥99.5 % в месяц | Гарантия доступности функции восстановления | **Given** мониторинг uptime <br>**When** суммарный простой <br>**Then** ≤3.6 ч в месяц | uptime report; grafana | #US-003 | devops | Proposed | P2 - Medium | S2 - Major | availability,slo |
+| NFR-003-9 | US-003 Password Reset | Usability | Ссылка в письме должна вести на форму сброса и работать ≥ 99 % случаев | Улучшение UX при восстановлении | **Given** полученное письмо <br>**When** пользователь кликает <br>**Then** страница открывается, токен валиден | UX-тест; QA-отчёт | #US-003 | frontend | Draft | P3 - Low | S3 - Minor | usability,ux |
+
+---
+
+## US-013 — Import CSV
+| ID | User Story / Feature | Category | Requirement (NFR) | Rationale / Risk | Acceptance (G-W-T) | Evidence (test/log/scan/policy) | Trace (issue/link) | Owner | Status | Priority | Severity | Tags |
+| -- | -------------------- | -------- | ----------------- | ---------------- | ------------------ | ------------------------------- | ------------------ | ----- | ------ | ----------- | ---------- | ---- |
+| NFR-013-1 | US-013 Import CSV | Security-InputValidation | `POST /api/import/csv`: ≤10 MiB, MIME = `text/csv` или `application/csv`; лишние колонки → 400 | Защита от DoS/грязных данных | **Given** CSV 12 MiB или неверный MIME <br>**When** POST <br>**Then** 413 (RFC7807) | e2e: `import-size-check` | #US-013 | backend | Draft | P1-High | S2-Major | validation,limits |
+| NFR-013-2 | US-013 Import CSV | Data-Integrity | Даты → UTC ISO-8601; строки → NFC; телефоны → E.164 | Предотвращение невалидных данных | **Given** разные форматы <br>**When** импорт <br>**Then** все данные нормализованы | unit: normalize-fields | #US-013 | backend | Draft | P2-Medium | S2-Major | integrity,data |
+| NFR-013-3 | US-013 Import CSV | Observability/Logging | Все шаги импорта логируются в JSON с `jobId` и `correlation_id` | Трассировка фоновых джоб | **Given** X-Correlation-ID <br>**When** импорт выполнен <br>**Then** jobId в логах | log sample; trace | #US-013 | devops | Proposed | P2-Medium | S3-Minor | logging,observability |
+| NFR-013-4 | US-013 Import CSV | Availability | `/health/ready` = 200 через ≤30 с после старта | Проверка готовности в CI/CD | **Given** контейнер запущен <br>**When** 30 с <br>**Then** `/health/ready` 200 | readiness probe | #US-013 | devops | Draft | P3-Low | S3-Minor | health,availability |
+| NFR-013-5 | US-013 Import CSV | Scalability | При росте нагрузки ×2 P95 растёт ≤1.2×; 5xx ≤1 % | Масштабируемость и SLO | **Given** 20 RPS <br>**When** 40 RPS <br>**Then** P95 ≤ 1.2× базы | loadtest report | #US-013 | backend | Proposed | P1-High | S2-Major | scalability,slo |
+| NFR-013-6 | US-013 Import CSV | API-Contract/Errors | Ошибки в RFC 7807, без stacktrace, с `correlation_id` | Единый формат ошибок | **Given** ошибка импорта <br>**When** ответ <br>**Then** формат RFC7807 | contract test | #US-013 | backend | Proposed | P2-Medium | S3-Minor | api,errors |
+| NFR-013-7 | US-013 Import CSV | Security-AuthZ | Импорт доступен только роли `manager` или `admin`; остальные → 403 | Защита от несанкционированного импорта | **Given** роль viewer <br>**When** POST <br>**Then** 403 | e2e authz test | #US-013 | backend | Draft | P1-High | S2-Major | authz,security |
+| NFR-013-8 | US-013 Import CSV | Privacy/PII | CSV не должен содержать PII (ИНН, телефон); проверка до импорта | Соответствие GDPR | **Given** CSV с PII <br>**When** загрузка <br>**Then** 400 и описание поля | validator policy | #US-013 | backend | Draft | P2-Medium | S2-Major | privacy,pii |
+| NFR-013-9 | US-013 Import CSV | Performance | 1000 строк обрабатываются ≤ 2 с; 100 k строк ≤ 60 с | UX/SLO при массовом импорте | **Given** CSV 100 k <br>**When** импорт <br>**Then** ≤ 60 с | perf test | #US-013 | backend | Proposed | P2-Medium | S2-Major | performance |
+| NFR-013-10 | US-013 Import CSV | Auditability | Каждая успешная операция импорта логируется в audit с пользователем и файлом | Контроль изменений данных | **Given** POST успешен <br>**When** просмотр audit <br>**Then** запись создана | audit log sample | #US-013 | devops | Proposed | P3-Low | S3-Minor | audit,logging |
+
+---
+
+## US-014 — Export CSV / JSON
+| ID | User Story / Feature | Category | Requirement (NFR) | Rationale / Risk | Acceptance (G-W-T) | Evidence (test/log/scan/policy) | Trace (issue/link) | Owner | Status | Priority | Severity | Tags |
+| -- | -------------------- | -------- | ----------------- | ---------------- | ------------------ | ------------------------------- | ------------------ | ----- | ------ | ----------- | ---------- | ---- |
+| NFR-014-1 | US-014 Export CSV/JSON | Privacy/PII | Экспорт по умолчанию без PII; `include_pii=true` только для admin/manager; ретенция ≤ 7 дней | Защита данных и конфиденциальность | **Given** viewer <br>**When** `include_pii=true` <br>**Then** 403 | e2e privacy mask | #US-014 | backend | Draft | P1-High | S1-Critical | privacy,pii |
+| NFR-014-2 | US-014 Export CSV/JSON | RateLimiting | ≤ 60 req/min на токен; 429 + `Retry-After` при превышении | Защита от злоупотреблений | **Given** 65 req <br>**When** 60 с <br>**Then** 429 | e2e ratelimit | #US-014 | backend | Draft | P2-Medium | S2-Major | limits |
+| NFR-014-3 | US-014 Export CSV/JSON | Performance | При 50 RPS P95 ≤ 500 ms (JSON), ≤ 800 ms (CSV); ошибки ≤ 1 % | SLO/UX | **Given** нагрузка 50 RPS <br>**When** экспорт <br>**Then** время в норме | perf report | #US-014 | backend | Proposed | P1-High | S2-Major | performance,slo |
+| NFR-014-4 | US-014 Export CSV/JSON | API-Contract/Errors | Ошибки в RFC 7807; `format=xml` → 400; нет auth → 401; нет прав → 403 | Единый контракт ошибок | **Given** `format=xml` <br>**When** GET <br>**Then** 400 RFC7807 | contract test | #US-014 | backend | Draft | P2-Medium | S3-Minor | api,errors |
+| NFR-014-5 | US-014 Export CSV/JSON | Security-AuthZ | Экспорт доступен только владельцу или роли admin | Защита данных от утечек | **Given** чужой tenant <br>**When** GET <br>**Then** 403 | e2e authz | #US-014 | backend | Draft | P1-High | S2-Major | authz,security |
+| NFR-014-6 | US-014 Export CSV/JSON | Scalability | 2× рост нагрузки → P95 ≤ 1.3×; ошибки ≤ 1 % | Масштабируемость API | **Given** база нагрузка <br>**When** ×2 <br>**Then** P95 ≤ 1.3× | loadtest | #US-014 | backend | Proposed | P2-Medium | S2-Major | scalability |
+| NFR-014-7 | US-014 Export CSV/JSON | Auditability | Каждый экспорт логируется с пользователем и фильтрами | Контроль доступа к данным | **Given** GET экспорт <br>**When** просмотр audit <br>**Then** запись есть | audit log | #US-014 | devops | Proposed | P3-Low | S3-Minor | audit,logging |
+| NFR-014-8 | US-014 Export CSV/JSON | Observability/Tracing | Все экспорты имеют `correlation_id`; метрики по времени и объёму в Prometheus | Диагностика и метрики | **Given** экспорт <br>**When** выполнен <br>**Then** traceId в логах и метрики обновлены | log sample; metrics | #US-014 | devops | Proposed | P3-Low | S3-Minor | observability |
+| NFR-014-9 | US-014 Export CSV/JSON | Availability | API экспорта ≥ 99.5 % uptime | Надёжность сервиса | **Given** мониторинг <br>**When** месяц <br>**Then** простой ≤ 3.6 ч | uptime report | #US-014 | devops | Proposed | P2-Medium | S2-Major | availability |
+| NFR-014-10 | US-014 Export CSV/JSON | Data-Integrity | Экспортированные данные совпадают с БД (контроль хэша или checksum) | Целостность данных при экспорте | **Given** GET экспорт <br>**When** проверен хэш <br>**Then** совпадает | checksum test | #US-014 | backend | Draft | P2-Medium | S2-Major | integrity,data |
+
+---
+
+## 5) Принятые решения (ADR)
 - **ADR (R‑04):** Валидация импорта и лимиты — шлюз: размер/MIME; S2: белый список схемы; нормализация; защита от CSV‑инъекций; RFC7807.
 - **ADR (R‑03):** Ролевой фильтр PII при экспорте — `include_pii` только для админов/уполномоченных; маскирование; lifecycle S3 ≤30д; аудит; feature‑flag.
-- **ADR (R‑05):** Подписанные HTTPS‑ссылки сброса + почтовые политики — HMAC‑подпись, TTL ≤15м, одноразово; DMARC/SPF/DKIM(+BIMI); rate‑limit /forgot; HSTS; без внешних редиректов.](<Отлично 
-Вот переработанные разделы **6 (Контроли / NFR)** и **7 (ADR)** по твоим критериям:
+- **ADR (R‑05):** Подписанные HTTPS‑ссылки сброса + почтовые политики — HMAC‑подпись, TTL ≤15м, одноразово; DMARC/SPF/DKIM(+BIMI); rate‑limit /forgot; HSTS; без внешних редиректов.
 
-Каждый **NFR** теперь в формате *Given–When–Then* и привязан к угрозе (STRIDE / риск).
-Каждый **ADR** оформлен как *Decision / DoD / Owner*, с коротким *Trade-off* и перечислением компонентов.
-Покрыты **Top-5 рисков (R-04, R-03, R-05, R-01, R-02)**.
-
----
-
-## ⚙️ 6) Контроли (NFR, выдержки в формате G-W-T)
-
-###  R-04 — Tampering при импорте CSV
-
-**NFR-013-1 — Валидация и размер файла**
-
-%3E **Given**: пользователь загружает CSV через `/import/csv`
-> **When**: MIME или размер превышает лимит (10 MiB, `text/csv`/`application/csv`)
-> **Then**: система возвращает `400` с RFC 7807-ответом и записью в аудит
-
-**NFR-013-2 — Строгая схема и нормализация**
-
-> **Given**: CSV проходит загрузку
-> **When**: встречаются неизвестные колонки, некорректные типы или формульные ячейки
-> **Then**: файл отклоняется, фиксируется причина; данные не доходят до хранилища
-
----
-
-### R-03 — Утечка PII при экспорте
-
-**NFR-014-1 — Ролевое управление флагом `include_pii`**
-
-> **Given**: запрос `/export` с параметром `include_pii=true`
-> **When**: роль ≠ `admin|dpo`
-> **Then**: возвращается `403` с сообщением «PII export forbidden»
-
-**NFR-014-2 — Маскирование и срок хранения**
-
-> **Given**: экспорт инициирован с разрешением на PII
-> **When**: формируются файлы с полями email/phone/ИНН
-> **Then**: поля маскируются по шаблону, файлы автоматически удаляются ≤ 7 дней
-
----
-
-### R-05 — Фишинг и злоупотребления письмами сброса
-
-**NFR-003-1 — Одноразовый HMAC-токен сброса**
-
-> **Given**: пользователь запрашивает сброс
-> **When**: токен создаётся и сохраняется
-> **Then**: токен имеет TTL ≤ 15 мин, одноразовый, подписан HMAC, хранится как хэш
-
-**NFR-003-2 — Политики почтовой доставки и ограничение частоты**
-
-> **Given**: 6-я попытка сброса с одного IP/email
-> **When**: превышен лимит (≤ 5 в час)
-> **Then**: возвращается `429`; письмо не отправляется; фиксируется событие для SIEM
-
----
-
-### R-01 — Утечка токенов в логах
-
-**NFR-003-4 — Маскирование секретов**
-
-> **Given**: сервис пишет структурированный лог
-> **When**: обнаружен ключ `token|secret|password`
-> **Then**: значение заменяется `***` перед отправкой в лог-агрегатор
-
----
-
-### R-02 — DoS массовыми импортами/экспортами
-
-**NFR-013-5 / NFR-014-2 — Rate limit и очередь заданий**
-
-> **Given**: клиент отправляет > N (например 10) параллельных импортов/экспортов
-> **When**: лимит превышен
-> **Then**: возвращается `429 Retry-After`, задача ставится в очередь; метрика фиксируется
-
----
-
-## 7) Принятые решения (ADR)
-
-| ID          | Decision                                                                                     | DoD (Definition of Done)                                                          | Owner                                                                          | Trade-offs                                           | Затронутые компоненты                         |                    |
-| ----------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------- | --------------------------------------------- | ------------------ |
-| **ADR-R04** | **“Input Sanitization & Size Limit”** — импорты принимаются только при соблюдении MIME/схемы | лимиты проверяются на API;  unit-тесты `sanitize_csv`;  e2e импорт > 10 MiB → 400 | Команда S2                                                                     | Безопасно; Увеличено время загрузки больших файлов   | Gateway, S2, Storage                          |                    |
-| **ADR-R03** | **“Role-Based PII Export”** — доступ к PII только `admin                                     | dpo`                                                                              | флаг `include_pii` требует роль;  маскирование тестируется;  lifecycle ≤ 7 дн. | Команда S3 / DPO                                     | Минимизирует утечки; Доп. логика ролей/флагов | Gateway, S3, DB/S3 |
-| **ADR-R05** | **“Signed Reset Link + Mail Policy”** — сброс через HMAC-ссылку и доверенные SMTP            | TTL ≤ 15 мин;  письмо без PII;  DKIM/SPF/DMARC тесты                              | Команда S1 / Security                                                          | Защита от фишинга;  Сложнее отладка внешней почты    | S1, SMTP, Gateway                             |                    |
-| **ADR-R01** | **“Structured Logging with Masking”** — внедрение фильтра логов                              | тест `no_token_in_logs`;  json-логгер обновлён;  SIEM rule активен                | Команда Core Ops                                                               | Исключает утечки;  Скрывает часть данных для отладки | Все сервисы                                   |                    |
-| **ADR-R02** | **“Async Queue & Rate Limiter”** — все экспорты/импорты через очередь                        |  установлен rate-limit;  нагрузочный тест %3C 80% CPU                             | Команда Platform                                                               | Снижение DoS; Добавлена задержка для фоновых задач   | Gateway, S2, S3                               |                    |
-
----
-
-Хочешь, чтобы я вставила эти обновлённые разделы **6–7** прямо в твой `TM.md` (заменив старые)?
-Могу также добавить после них короткий **сводный список Threat→NFR→ADR→Owner**, чтобы отслеживать ответственных по каждому риску.>)
-## 8) Трассировка Threat → NFR → ADR → Тесты
+## 6) Трассировка Threat → NFR → ADR → Тесты
 | Threat/Risk | NFR | ADR/Политика | Evidence/Тесты |
 |---|---|---|---|
 | CSV tampering (R‑04) | NFR‑013‑1/2 | ADR R‑04 | e2e: `import-size-check`, `schema-extra-cols`; unit: `normalize-fields`, `sanitize-formulas` |
@@ -209,7 +163,7 @@ graph TD
 | Tokens in logs (R‑01) | NFR‑003‑4/7 | Политика mask/strip | Лог‑скан по сигнатурам секретов; JSON‑структура |
 | DoS import/export (R‑02) | NFR‑013‑5, NFR‑014‑2 | Rate‑limit + Queue | Нагрузочные тесты; 429 + Retry‑After |
 
-## 9) Тестирование, наблюдаемость, соответствие
+## 7) Тестирование, наблюдаемость, соответствие
 - **Контракт ошибок:** RFC7807 с `correlation_id` во всех сервисах.
 - **Аудит:** события импорта/экспорта/сброса, правила SIEM для аномалий.
 - **Приватность:** экспорт без PII по умолчанию; маскирование; короткий retention.
@@ -217,425 +171,15 @@ graph TD
 - **Почта:** SPF/DKIM/DMARC (p=reject), опц. BIMI.
 - **Метрики:** таймеры и счётчики отказов/отбрасываний; дэшборды.
 
-## 10) Открытые вопросы
+## 8) Открытые вопросы
 - Политика обработки ячеек, похожих на формулы: экранировать vs. отклонять файл при порогах.
 - Детализация маскировки по полям (пример: телефоны — последние 4 цифры).
 - Применение lifecycle к выгрузкам внешней аналитики.
 - Коды для просроченных/повторно использованных токенов (410 vs 409).
 
-## 11) Приложения (артефакты)
+## 9) Приложения (артефакты)
 - DFD — `S04_dfd.md`
 - STRIDE‑матрица — `S04_stride_matrix.md`
 - Оценка рисков — `S04_risk_scoring.md`
 - Реестр NFR — `S03_register.md`
-- ADR и Option‑матрицы — `S05_*`](<Хорошо. Ниже — полностью обновлённая версия **TM.md (на русском)** без эмодзи, с учётом всех улучшений:
-
-* улучшенный **реестр рисков** с факторами (экспозиция, чувствительность, частота/обнаружимость);
-* **контроли (NFR)** в формате *Given–When–Then*;
-* **принятые решения (ADR)** в формате *Decision / DoD / Owner / Trade-offs / Components*;
-* сохранены разделы DFD, контекст, STRIDE, трассировка и приложения.
-
----
-
-# TM — Модель угроз
-
-Версия: 1.2 • Дата: 2025-10-12 • Владелец: Security/Architecture
-
-## 1) Область и обзор системы
-
-Цель: сервисы **Аутентификации/Сброса пароля (S1)**, **Импорта CSV (S2)** и **Экспорта CSV/JSON (S3)** за API-шлюзом (**A**), с хранилищем (**D: PostgreSQL/объектное**), интеграциями SMTP (**X**) и внешним Analytics API (**Y**).
-Разделены границы доверия: Интернет ↔ Сервис, Сервис ↔ Внешние провайдеры, Сервис ↔ Хранилища.
-
-### 1.1 DFD (Mermaid)
-
-```mermaid
-flowchart LR
-  subgraph Internet [Интернет / Клиентская зона]
-    U[Пользователь / Клиент]
-  end
-
-  subgraph Core [Сервисная зона]
-    A[API Gateway / Controller]
-    S1[Сервис S1: Сброс пароля]
-    S2[Сервис S2: Импорт CSV]
-    S3[Сервис S3: Экспорт CSV/JSON]
-    D[(Хранилище D: БД / Объектное)]
-  end
-
-  subgraph External [Внешние провайдеры]
-    X[SMTP / Почтовый сервис]
-    Y[Analytics API (опционально)]
-  end
-
-  U --%3E|POST /auth/forgot| A
-  U -->|POST /auth/reset| A
-  U -->|POST /import/csv| A
-  U -->|GET /export?format=csv|json| A
-
-  A --> S1
-  A --> S2
-  A --> S3
-
-  S1 %3C--> D
-  S2 --> D
-  S3 <--> D
-
-  S1 -->|Письмо сброса| X
-  S3 -->|Опционально| Y
-
-  A -. audit/logs .-> D
-  S2 -. import-job logs .-> D
-  S3 -. export-job logs .-> D
-```
-
-### 1.2 Диаграмма контекста (Mermaid)
-
-```mermaid
-graph TD
-  U[Users/Admins] -->|HTTPS| A[API Gateway]
-  A -->|RBAC| S3[Export Service]
-  A -->|Validation| S2[Import Service]
-  A -->|Reset Flow| S1[Auth/Reset Service]
-  S1 -->|Hash(token), Audit| D[(DB/Storage)]
-  S2 -->|Validated rows| D
-  S3 -->|Read/Mask| D
-  S1 -->|Email reset| X[SMTP]
-  S3 -->|Optional calls| Y[Analytics API]
-```
-
-## 2) Активы и цели безопасности
-
-* Учётные данные и токены сброса — конфиденциальность, целостность, одноразовость.
-* Наборы клиентских данных (PII) — конфиденциальность, минимизация, законность обработки.
-* Доступность сервисов импорта/экспорта — соблюдение SLA/SLO.
-* Операционные логи — структурированные, без секретов и PII, трассировка по `correlation_id`.
-
-## 3) Границы доверия
-
-1. Интернет ↔ Сервис (U↔A) — публичные API, загрузка и выгрузка файлов.
-2. Сервис ↔ Внешние (A↔X/Y) — почта и внешние API.
-3. Сервис ↔ Хранилища (S*↔D) — база данных и объектное хранилище.
-
-## 4) STRIDE (сводка)
-
-| Категория                  | Пример угрозы                               | Основная защита                                              |
-| -------------------------- | ------------------------------------------- | ------------------------------------------------------------ |
-| S (Spoofing)               | Подделка запросов, фишинговые ссылки сброса | Подписанные ссылки, унифицированные ответы, rate-limit       |
-| T (Tampering)              | Вредоносный CSV, изменение структуры данных | MIME/размер, белый список схемы, нормализация, защита формул |
-| R (Repudiation)            | Отказ от факта импорта/экспорта             | Аудит, логи, `correlation_id`                                |
-| I (Information Disclosure) | Утечка PII при экспорте                     | RBAC `include_pii`, маскирование, аудит                      |
-| D (Denial of Service)      | Массовые запросы, нагрузка на сервис        | Rate-limit, очередь, таймауты                                |
-| E (Elevation of Privilege) | Обход ролей при экспорте                    | Централизованный RBAC, проверки на шлюзе и в сервисах        |
-
-## 5) Реестр рисков (топ)
-
-| ID   | Риск                                     |  L  |  I  | E (экспозиция) | S (чувств.) | F/O (частота / обнаруж.) | Обоснование                                                                                                                      |
-| ---- | ---------------------------------------- | :-: | :-: | :------------: | :---------: | :----------------------: | -------------------------------------------------------------------------------------------------------------------------------- |
-| R-04 | Tampering при импорте CSV                |  H  |  H  |        H       |      M      |           H / L          | Импорт — массовая операция, часто внешние CSV. Возможна подмена данных или инъекции формул. Обнаружение до обработки затруднено. |
-| R-03 | Утечка PII при экспорте                  |  M  |  C  |        M       |      H      |           M / M          | Ошибки ролей или флага `include_pii` приводят к утечкам персональных данных. Контроль осуществляется только постфактум.          |
-| R-05 | Фишинг и злоупотребления письмами сброса |  M  |  H  |        H       |      H      |           H / M          | Почтовые ссылки могут быть подделаны или перехвачены. Пользователи уязвимы к фишингу. Отслеживается через SIEM.                  |
-| R-01 | Утечка токенов в логах                   |  L  |  H  |        M       |      H      |           L / H          | Возможна при отладке или verbose-режимах. Токен — чувствительный артефакт доступа.                                               |
-| R-02 | DoS массовыми импортами/экспортами       |  M  |  M  |        H       |      L      |           H / M          | Большой объём задач блокирует воркеры. Обнаруживается метриками, требует лимитов.                                                |
-
-## 6) Контроли (NFR, Given–When–Then)
-
-### R-04 — Tampering при импорте CSV
-
-**NFR-013-1 — Валидация и размер файла**
-Given: пользователь загружает CSV через `/import/csv`
-When: MIME или размер превышает лимит (10 MiB, `text/csv`, `application/csv`)
-Then: система возвращает `400` с RFC7807 и записью в аудит
-
-**NFR-013-2 — Строгая схема и нормализация**
-Given: CSV проходит загрузку
-When: встречаются неизвестные колонки, формульные ячейки или некорректные типы
-Then: файл отклоняется, фиксируется причина, данные не сохраняются
-
-### R-03 — Утечка PII при экспорте
-
-**NFR-014-1 — Ролевое управление `include_pii`**
-Given: запрос `/export` с `include_pii=true`
-When: роль ≠ `admin|dpo`
-Then: возвращается `403` и событие фиксируется в аудит
-
-**NFR-014-2 — Маскирование и срок хранения**
-Given: экспорт разрешён
-When: формируются файлы с полями email/phone/ИНН
-Then: данные маскируются, файлы удаляются ≤7 дней
-
-### R-05 — Фишинг при сбросе
-
-**NFR-003-1 — Одноразовый HMAC-токен**
-Given: пользователь запрашивает сброс
-When: создаётся токен
-Then: TTL ≤15 мин, одноразовый, хранится как SHA-256 хэш
-
-**NFR-003-2 — Ограничение частоты сброса**
-Given: 6-я попытка с одного IP/email
-When: превышен лимит (≤5 в час)
-Then: возвращается `429`, письмо не отправляется, создаётся запись в SIEM
-
-### R-01 — Утечка токенов в логах
-
-**NFR-003-4 — Маскирование секретов**
-Given: сервис пишет лог
-When: обнаружен ключ `token|secret|password`
-Then: значение заменяется `***` перед записью
-
-### R-02 — DoS массовыми задачами
-
-**NFR-013-5 / NFR-014-2 — Rate limit и очередь**
-Given: клиент отправляет >N параллельных импортов/экспортов
-When: лимит превышен
-Then: возвращается `429 Retry-After`, задача ставится в очередь
-
-## 7) Принятые решения (ADR)
-
-| ID      | Decision                                                                               | DoD (Definition of Done)                                                      | Owner                | Trade-offs                                            | Затронутые компоненты |
-| ------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------- | ----------------------------------------------------- | --------------------- |
-| ADR-R04 | Input Sanitization & Size Limit — импорты принимаются только при соблюдении MIME/схемы | лимиты проверяются на API; unit-тесты `sanitize_csv`; e2e импорт >10MiB → 400 | Команда S2           | Безопасно, но увеличено время загрузки больших файлов | Gateway, S2, Storage  |
-| ADR-R03 | Role-Based PII Export — доступ к PII только admin/dpo                                  | проверка флага, маскирование, lifecycle ≤7дн                                  | Команда S3, DPO      | Минимизация утечек, но усложнение ролей               | Gateway, S3, DB/S3    |
-| ADR-R05 | Signed Reset Link + Mail Policy — HMAC-ссылка, TTL ≤15мин, DMARC/SPF/DKIM              | проверены TTL, шаблон письма без PII                                          | Команда S1, Security | Сильная защита, но сложнее отладка SMTP               | S1, SMTP, Gateway     |
-| ADR-R01 | Structured Logging with Masking — фильтр логов                                         | тест `no_token_in_logs`, обновлён json-логгер                                 | Core Ops             | Исключает утечки, но скрывает часть отладочных данных | Все сервисы           |
-| ADR-R02 | Async Queue & Rate Limiter — импорт/экспорт через очередь                              | установлен rate-limit, нагрузочный тест <80% CPU                              | Platform Team        | Устойчивость к DoS, но небольшая задержка задач       | Gateway, S2, S3       |
-
-## 8) Трассировка Threat → NFR → ADR → Тесты
-
-| Threat/Risk              | NFR                  | ADR/Политика | Тесты/Доказательства                                   |
-| ------------------------ | -------------------- | ------------ | ------------------------------------------------------ |
-| CSV tampering (R-04)     | NFR-013-1/2          | ADR-R04      | e2e: `import-size-check`, unit: `sanitize-formulas`    |
-| PII export leak (R-03)   | NFR-014-1/2          | ADR-R03      | e2e: `export_pii_access_test`, unit: `mask_pii_fields` |
-| Phishing reset (R-05)    | NFR-003-1/2          | ADR-R05      | e2e: `email-template-check`, unit: `token-hmac-verify` |
-| Token in logs (R-01)     | NFR-003-4            | ADR-R01      | unit: `no_token_in_logs`, SIEM check                   |
-| DoS import/export (R-02) | NFR-013-5, NFR-014-2 | ADR-R02      | load tests, 429 с Retry-After                          |
-
-## 9) Тестирование, наблюдаемость и соответствие
-
-* Контракт ошибок: RFC7807 с `correlation_id`.
-* Аудит: события импорта/экспорта/сброса фиксируются и анализируются в SIEM.
-* Приватность: экспорт без PII по умолчанию; retention ≤7–30 дней.
-* Доступность: SLO ≥99.5% для критичных функций.
-* Почтовая безопасность: SPF/DKIM/DMARC (p=reject), BIMI.
-* Метрики: таймеры, счётчики ошибок, лимиты нагрузки.
-
-## 10) Открытые вопросы
-
-* Обработка ячеек, похожих на формулы: экранировать или отклонять.
-* Детализация маскировки по полям (например, последние 4 цифры телефона).
-* Применение lifecycle к аналитическим выгрузкам.
-* Коды ответов для просроченных токенов (410 vs 409).
-
-## 11) Приложения
-
-* S04_dfd.md — диаграмма потоков данных
-* S04_stride_matrix.md — STRIDE
-* S04_risk_scoring.md — оценка рисков
-* S03_register.md — реестр NFR
-* S05_* — ADR и Option Matrix
-
----
-
-Хочешь, чтобы я сохранила этот итоговый вариант как новый **TM.md**-файл (с заменой текущего в проекте)?>)](<Хорошо. Ниже — полностью обновлённая версия **TM.md (на русском)** без эмодзи, с учётом всех улучшений:
-
-* улучшенный **реестр рисков** с факторами (экспозиция, чувствительность, частота/обнаружимость);
-* **контроли (NFR)** в формате *Given–When–Then*;
-* **принятые решения (ADR)** в формате *Decision / DoD / Owner / Trade-offs / Components*;
-* сохранены разделы DFD, контекст, STRIDE, трассировка и приложения.
-
----
-
-# TM — Модель угроз
-
-Версия: 1.2 • Дата: 2025-10-12 • Владелец: Security/Architecture
-
-## 1) Область и обзор системы
-
-Цель: сервисы **Аутентификации/Сброса пароля (S1)**, **Импорта CSV (S2)** и **Экспорта CSV/JSON (S3)** за API-шлюзом (**A**), с хранилищем (**D: PostgreSQL/объектное**), интеграциями SMTP (**X**) и внешним Analytics API (**Y**).
-Разделены границы доверия: Интернет ↔ Сервис, Сервис ↔ Внешние провайдеры, Сервис ↔ Хранилища.
-
-### 1.1 DFD (Mermaid)
-
-```mermaid
-flowchart LR
-  subgraph Internet [Интернет / Клиентская зона]
-    U[Пользователь / Клиент]
-  end
-
-  subgraph Core [Сервисная зона]
-    A[API Gateway / Controller]
-    S1[Сервис S1: Сброс пароля]
-    S2[Сервис S2: Импорт CSV]
-    S3[Сервис S3: Экспорт CSV/JSON]
-    D[(Хранилище D: БД / Объектное)]
-  end
-
-  subgraph External [Внешние провайдеры]
-    X[SMTP / Почтовый сервис]
-    Y[Analytics API (опционально)]
-  end
-
-  U --%3E|POST /auth/forgot| A
-  U -->|POST /auth/reset| A
-  U -->|POST /import/csv| A
-  U -->|GET /export?format=csv|json| A
-
-  A --> S1
-  A --> S2
-  A --> S3
-
-  S1 %3C--> D
-  S2 --> D
-  S3 <--> D
-
-  S1 -->|Письмо сброса| X
-  S3 -->|Опционально| Y
-
-  A -. audit/logs .-> D
-  S2 -. import-job logs .-> D
-  S3 -. export-job logs .-> D
-```
-
-### 1.2 Диаграмма контекста (Mermaid)
-
-```mermaid
-graph TD
-  U[Users/Admins] -->|HTTPS| A[API Gateway]
-  A -->|RBAC| S3[Export Service]
-  A -->|Validation| S2[Import Service]
-  A -->|Reset Flow| S1[Auth/Reset Service]
-  S1 -->|Hash(token), Audit| D[(DB/Storage)]
-  S2 -->|Validated rows| D
-  S3 -->|Read/Mask| D
-  S1 -->|Email reset| X[SMTP]
-  S3 -->|Optional calls| Y[Analytics API]
-```
-
-## 2) Активы и цели безопасности
-
-* Учётные данные и токены сброса — конфиденциальность, целостность, одноразовость.
-* Наборы клиентских данных (PII) — конфиденциальность, минимизация, законность обработки.
-* Доступность сервисов импорта/экспорта — соблюдение SLA/SLO.
-* Операционные логи — структурированные, без секретов и PII, трассировка по `correlation_id`.
-
-## 3) Границы доверия
-
-1. Интернет ↔ Сервис (U↔A) — публичные API, загрузка и выгрузка файлов.
-2. Сервис ↔ Внешние (A↔X/Y) — почта и внешние API.
-3. Сервис ↔ Хранилища (S*↔D) — база данных и объектное хранилище.
-
-## 4) STRIDE (сводка)
-
-| Категория                  | Пример угрозы                               | Основная защита                                              |
-| -------------------------- | ------------------------------------------- | ------------------------------------------------------------ |
-| S (Spoofing)               | Подделка запросов, фишинговые ссылки сброса | Подписанные ссылки, унифицированные ответы, rate-limit       |
-| T (Tampering)              | Вредоносный CSV, изменение структуры данных | MIME/размер, белый список схемы, нормализация, защита формул |
-| R (Repudiation)            | Отказ от факта импорта/экспорта             | Аудит, логи, `correlation_id`                                |
-| I (Information Disclosure) | Утечка PII при экспорте                     | RBAC `include_pii`, маскирование, аудит                      |
-| D (Denial of Service)      | Массовые запросы, нагрузка на сервис        | Rate-limit, очередь, таймауты                                |
-| E (Elevation of Privilege) | Обход ролей при экспорте                    | Централизованный RBAC, проверки на шлюзе и в сервисах        |
-
-## 5) Реестр рисков (топ)
-
-| ID   | Риск                                     |  L  |  I  | E (экспозиция) | S (чувств.) | F/O (частота / обнаруж.) | Обоснование                                                                                                                      |
-| ---- | ---------------------------------------- | :-: | :-: | :------------: | :---------: | :----------------------: | -------------------------------------------------------------------------------------------------------------------------------- |
-| R-04 | Tampering при импорте CSV                |  H  |  H  |        H       |      M      |           H / L          | Импорт — массовая операция, часто внешние CSV. Возможна подмена данных или инъекции формул. Обнаружение до обработки затруднено. |
-| R-03 | Утечка PII при экспорте                  |  M  |  C  |        M       |      H      |           M / M          | Ошибки ролей или флага `include_pii` приводят к утечкам персональных данных. Контроль осуществляется только постфактум.          |
-| R-05 | Фишинг и злоупотребления письмами сброса |  M  |  H  |        H       |      H      |           H / M          | Почтовые ссылки могут быть подделаны или перехвачены. Пользователи уязвимы к фишингу. Отслеживается через SIEM.                  |
-| R-01 | Утечка токенов в логах                   |  L  |  H  |        M       |      H      |           L / H          | Возможна при отладке или verbose-режимах. Токен — чувствительный артефакт доступа.                                               |
-| R-02 | DoS массовыми импортами/экспортами       |  M  |  M  |        H       |      L      |           H / M          | Большой объём задач блокирует воркеры. Обнаруживается метриками, требует лимитов.                                                |
-
-## 6) Контроли (NFR, Given–When–Then)
-
-### R-04 — Tampering при импорте CSV
-
-**NFR-013-1 — Валидация и размер файла**
-Given: пользователь загружает CSV через `/import/csv`
-When: MIME или размер превышает лимит (10 MiB, `text/csv`, `application/csv`)
-Then: система возвращает `400` с RFC7807 и записью в аудит
-
-**NFR-013-2 — Строгая схема и нормализация**
-Given: CSV проходит загрузку
-When: встречаются неизвестные колонки, формульные ячейки или некорректные типы
-Then: файл отклоняется, фиксируется причина, данные не сохраняются
-
-### R-03 — Утечка PII при экспорте
-
-**NFR-014-1 — Ролевое управление `include_pii`**
-Given: запрос `/export` с `include_pii=true`
-When: роль ≠ `admin|dpo`
-Then: возвращается `403` и событие фиксируется в аудит
-
-**NFR-014-2 — Маскирование и срок хранения**
-Given: экспорт разрешён
-When: формируются файлы с полями email/phone/ИНН
-Then: данные маскируются, файлы удаляются ≤7 дней
-
-### R-05 — Фишинг при сбросе
-
-**NFR-003-1 — Одноразовый HMAC-токен**
-Given: пользователь запрашивает сброс
-When: создаётся токен
-Then: TTL ≤15 мин, одноразовый, хранится как SHA-256 хэш
-
-**NFR-003-2 — Ограничение частоты сброса**
-Given: 6-я попытка с одного IP/email
-When: превышен лимит (≤5 в час)
-Then: возвращается `429`, письмо не отправляется, создаётся запись в SIEM
-
-### R-01 — Утечка токенов в логах
-
-**NFR-003-4 — Маскирование секретов**
-Given: сервис пишет лог
-When: обнаружен ключ `token|secret|password`
-Then: значение заменяется `***` перед записью
-
-### R-02 — DoS массовыми задачами
-
-**NFR-013-5 / NFR-014-2 — Rate limit и очередь**
-Given: клиент отправляет >N параллельных импортов/экспортов
-When: лимит превышен
-Then: возвращается `429 Retry-After`, задача ставится в очередь
-
-## 7) Принятые решения (ADR)
-
-| ID      | Decision                                                                               | DoD (Definition of Done)                                                      | Owner                | Trade-offs                                            | Затронутые компоненты |
-| ------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------- | ----------------------------------------------------- | --------------------- |
-| ADR-R04 | Input Sanitization & Size Limit — импорты принимаются только при соблюдении MIME/схемы | лимиты проверяются на API; unit-тесты `sanitize_csv`; e2e импорт >10MiB → 400 | Команда S2           | Безопасно, но увеличено время загрузки больших файлов | Gateway, S2, Storage  |
-| ADR-R03 | Role-Based PII Export — доступ к PII только admin/dpo                                  | проверка флага, маскирование, lifecycle ≤7дн                                  | Команда S3, DPO      | Минимизация утечек, но усложнение ролей               | Gateway, S3, DB/S3    |
-| ADR-R05 | Signed Reset Link + Mail Policy — HMAC-ссылка, TTL ≤15мин, DMARC/SPF/DKIM              | проверены TTL, шаблон письма без PII                                          | Команда S1, Security | Сильная защита, но сложнее отладка SMTP               | S1, SMTP, Gateway     |
-| ADR-R01 | Structured Logging with Masking — фильтр логов                                         | тест `no_token_in_logs`, обновлён json-логгер                                 | Core Ops             | Исключает утечки, но скрывает часть отладочных данных | Все сервисы           |
-| ADR-R02 | Async Queue & Rate Limiter — импорт/экспорт через очередь                              | установлен rate-limit, нагрузочный тест <80% CPU                              | Platform Team        | Устойчивость к DoS, но небольшая задержка задач       | Gateway, S2, S3       |
-
-## 8) Трассировка Threat → NFR → ADR → Тесты
-
-| Threat/Risk              | NFR                  | ADR/Политика | Тесты/Доказательства                                   |
-| ------------------------ | -------------------- | ------------ | ------------------------------------------------------ |
-| CSV tampering (R-04)     | NFR-013-1/2          | ADR-R04      | e2e: `import-size-check`, unit: `sanitize-formulas`    |
-| PII export leak (R-03)   | NFR-014-1/2          | ADR-R03      | e2e: `export_pii_access_test`, unit: `mask_pii_fields` |
-| Phishing reset (R-05)    | NFR-003-1/2          | ADR-R05      | e2e: `email-template-check`, unit: `token-hmac-verify` |
-| Token in logs (R-01)     | NFR-003-4            | ADR-R01      | unit: `no_token_in_logs`, SIEM check                   |
-| DoS import/export (R-02) | NFR-013-5, NFR-014-2 | ADR-R02      | load tests, 429 с Retry-After                          |
-
-## 9) Тестирование, наблюдаемость и соответствие
-
-* Контракт ошибок: RFC7807 с `correlation_id`.
-* Аудит: события импорта/экспорта/сброса фиксируются и анализируются в SIEM.
-* Приватность: экспорт без PII по умолчанию; retention ≤7–30 дней.
-* Доступность: SLO ≥99.5% для критичных функций.
-* Почтовая безопасность: SPF/DKIM/DMARC (p=reject), BIMI.
-* Метрики: таймеры, счётчики ошибок, лимиты нагрузки.
-
-## 10) Открытые вопросы
-
-* Обработка ячеек, похожих на формулы: экранировать или отклонять.
-* Детализация маскировки по полям (например, последние 4 цифры телефона).
-* Применение lifecycle к аналитическим выгрузкам.
-* Коды ответов для просроченных токенов (410 vs 409).
-
-## 11) Приложения
-
-* S04_dfd.md — диаграмма потоков данных
-* S04_stride_matrix.md — STRIDE
-* S04_risk_scoring.md — оценка рисков
-* S03_register.md — реестр NFR
-* S05_* — ADR и Option Matrix
+- ADR и Option‑матрицы — `S05_*`
